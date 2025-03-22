@@ -13,7 +13,7 @@ class UlogHandler(Node):
     def __init__(self):
         super().__init__('ulog_handler')
         self.base_log_dir = "/home/alexei/PX4_ecosystem/src/client/PX4-Autopilot/build/px4_sitl_default/rootfs/log"  # Укажите путь к директории с ulog-файлами
-        self.server_url = "http://localhost:3000/ulog"  # Укажите URL сервера
+        self.server_url = "http://localhost:5000/ulog"  # Укажите URL сервера
         self.last_sent_file = None
 
         self.qos_profile = QoSProfile(depth=10)
