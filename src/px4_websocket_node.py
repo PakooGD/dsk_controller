@@ -1,29 +1,30 @@
-import rclpy
-from rclpy.node import Node
+import os
+import glob
+import time
 import asyncio
 import websockets
 import json
+import rclpy
+from rclpy.node import Node
+from queue import Queue
+import uuid
+import hmac
+import jwt
+import base64
+from hashlib import sha256
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 import numpy as np
 import math
 import importlib
-from collections import defaultdict
-import time
-import requests
-import uuid
-import jwt
-import hmac
-from hashlib import sha256
-import base64
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-import base64
 from collections import deque
+import requests
 
 SECRET_KEY = 'dsksupplytech' 
-DRONE_ID = str(uuid.uuid4())
-
 SECRET_MESSAGE_KEY = b'kchar-long-secret-key-1234567890'
+
+DRONE_ID = str(uuid.uuid4())
 
 # Blocklist типов сообщений
 UNSUPPORTED_MSG_TYPES = []
@@ -31,7 +32,7 @@ UNSUPPORTED_MSG_TYPES = []
 # Подпись сообщения
 def sign_message(message: str) -> str:
     """Подписывает сообщение с использованием HMAC."""
-    hash = hmac.new(SECRET_KEY.encode(),message.encode(),sha256).hexdigest()
+    hash = hmac.new(SECRET_KEY.encode(), message.encode(), sha256).hexdigest()
     return hash
 
 def camel_to_snake_case(name: str) -> str:
@@ -40,27 +41,27 @@ def camel_to_snake_case(name: str) -> str:
 def topic_to_camel(topic: str) -> str:
     if topic.startswith('/fmu/out/'):
         topic = topic[len('/fmu/out/'):]
-
     camelName = ''.join(word.capitalize() for word in topic.split('_'))
-    
     return camelName
 
 def is_token_expired(token: str) -> bool:
-        """Проверяет, истек ли срок действия токена."""
-        try:
-            decoded = jwt.decode(token, options={"verify_signature": False}) 
-            expiration_time = decoded.get('exp') 
-            if expiration_time is None:
-                return True  
-            return time.time() >= expiration_time  
-        except Exception as e:
-            print(f"Error decoding token: {e}")
-            return True  
+    """Проверяет, истек ли срок действия токена."""
+    try:
+        decoded = jwt.decode(token, options={"verify_signature": False})
+        expiration_time = decoded.get('exp')
+        if expiration_time is None:
+            return True
+        return time.time() >= expiration_time
+    except Exception as e:
+        print(f"Error decoding token: {e}")
+        return True
 
-def encrypt_data(data: str) -> str:
-    """Шифрует данные с использованием AES."""
+def encrypt_data(data) -> str:
+    """Шифрует данные (строки или байты) с использованием AES."""
+    if isinstance(data, str):
+        data = data.encode()
     cipher = AES.new(SECRET_MESSAGE_KEY, AES.MODE_CBC)
-    ct_bytes = cipher.encrypt(pad(data.encode(), AES.block_size))
+    ct_bytes = cipher.encrypt(pad(data, AES.block_size))
     iv = base64.b64encode(cipher.iv).decode('utf-8')
     ct = base64.b64encode(ct_bytes).decode('utf-8')
     return json.dumps({'iv': iv, 'ciphertext': ct})
@@ -80,7 +81,9 @@ class PX4WebSocketBridge(Node):
         
         self.message_queue = deque()
         self.ack_queue = asyncio.Queue()
-        
+
+        self.data_queue = Queue()
+
         self.websocket_url = 'ws://localhost:8082'
         self.http_url = 'http://localhost:5000/api'
 
@@ -90,7 +93,80 @@ class PX4WebSocketBridge(Node):
         self.access_token = None
         self.refresh_token = None
 
+        self.last_sent_file = None
+        self.base_log_dir = "/home/alexei/Projects/PX4_ecosystem/src/client/PX4-Autopilot/build/px4_sitl_default/rootfs/log"
+        
         self.authenticate()
+
+    def get_latest_log_dir(self, base_dir):
+        """Найти последнюю папку с логами в директории."""
+        list_of_dirs = glob.glob(os.path.join(base_dir, "*/"))
+        if not list_of_dirs:
+            return None
+        date_dirs = [d for d in list_of_dirs if os.path.basename(os.path.normpath(d)).count('-') == 2]
+        if not date_dirs:
+            return None
+        latest_dir = max(date_dirs, key=os.path.getmtime)
+        return latest_dir
+
+    def get_latest_ulog_file(self, log_dir):
+        """Получить последний созданный ulog-файл."""
+        list_of_files = glob.glob(os.path.join(log_dir, "*.ulg"))
+        if not list_of_files:
+            return None
+        latest_file = max(list_of_files, key=os.path.getctime)
+        return latest_file
+
+    async def send_ulog_file(self, file_path):
+        """Отправка ulog-файла по частям с гарантированной доставкой."""
+        if not os.path.exists(file_path):
+            return False
+
+        try:
+            with open(file_path, 'rb') as f:
+                chunk_index = 0
+                while chunk := f.read(1024 * 1024):  # Читаем по 1 МБ
+                    # Кодируем чанк в base64
+                    chunk_base64 = base64.b64encode(chunk).decode('utf-8')
+
+                    # Формируем payload
+                    payload = {
+                        'type': 'file_chunk',
+                        'droneId': DRONE_ID,
+                        'filename': os.path.basename(file_path),
+                        'chunk_index': chunk_index,
+                        'chunk_data': chunk_base64,  # Отправляем данные в base64
+                        'is_last_chunk': f.tell() == os.path.getsize(file_path)
+                    }
+
+                    await self.send_data_with_ack('file_chunk', payload)
+                    chunk_index += 1
+            self.get_logger().info(f"File {file_path} sent successfully.")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Error sending file: {e}")
+            return False
+        
+    async def monitor_and_send(self, interval=10):
+        """Мониторинг директории с настраиваемым интервалом."""
+        while True:
+            try:
+                if self.access_token and not is_token_expired(self.access_token):
+                    latest_dir = self.get_latest_log_dir(self.base_log_dir)
+                    if latest_dir:
+                        latest_file = self.get_latest_ulog_file(latest_dir)
+                        if latest_file and latest_file != self.last_sent_file:
+                            if await self.send_ulog_file(latest_file):
+                                self.last_sent_file = latest_file
+                    else:
+                        self.get_logger().info("No log directories found.")
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                self.get_logger().info("Monitor task cancelled.")
+                raise
+            except Exception as e:
+                self.get_logger().error(f"Error in monitor_and_send: {e}")
+                await asyncio.sleep(interval)  # Продолжаем после ошибки
 
     def ensure_tokens_are_valid(self) -> bool:
             """Проверяет актуальность токенов и обновляет их при необходимости."""
@@ -108,7 +184,6 @@ class PX4WebSocketBridge(Node):
         if not self.refresh_token or is_token_expired(self.refresh_token):
             self.get_logger().error("Refresh token is missing or expired.")
             return False
-
         try:
             response = requests.post(
                 f"{self.http_url}/refresh",
@@ -125,16 +200,11 @@ class PX4WebSocketBridge(Node):
             self.get_logger().error(f"Error refreshing access token: {e}")
             return False
 
-    def authenticate(self):
+    def authenticate(self,retry_delay=5):
         """Авторизация дрона на сервере с повторными попытками."""
-        auth_data = {
-            'drone_id': DRONE_ID,
-        }
-        retry_delay = 5
-
         while True:
             try:
-                response = requests.post(f"{self.http_url}/auth", json=auth_data)
+                response = requests.post(f"{self.http_url}/auth", json={'drone_id': DRONE_ID,})
                 
                 if response.status_code == 200:
  
@@ -162,170 +232,94 @@ class PX4WebSocketBridge(Node):
             self.get_logger().info(f"Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
 
-    def get_all_schemas(self):
-        """Получение всех схем для топиков."""
-        package = importlib.import_module('px4_msgs.msg')
-
-        message_names = [msg for msg in dir(package) if msg[0].isupper()]  # Фильтр по заглавной букве
-        
-        schemas = []
-        for name in message_names:
-            if name in UNSUPPORTED_MSG_TYPES:
-                continue
-     
-            topic_name = self.get_topic_name(name)
-            
-            if not self.is_topic_active(topic_name):
-                continue
-
-            msg = getattr(package, name)
-
-            schema = self.generate_schema(msg)
-            schemas.append({
-                'topic': name,
-                'encoding': "json",
-                'schemaName': topic_name,   
-                'schema': schema
-            })
-        return schemas
-
-    def generate_schema(self, msg):
-        """Генерация схемы для типа сообщения."""
-        schema = {"type": "object", "properties": {}}
-
-        if not hasattr(msg, '__slots__'):
-            return schema
-        
-        internal_fields = {'_header', '_stamp'}
-
-        for field in msg.__slots__:
-            if field in internal_fields:
-                continue
-
-            field_name = ''.join(word.capitalize() for word in field.lstrip('_').split('_'))
-            value = getattr(msg, field)
-
-            if isinstance(value, (int, float, np.floating)):
-                if math.isnan(value) or math.isinf(value):
-                    schema["properties"][field_name] = {"type": "string"}
-                else:
-                    schema["properties"][field_name] = {"type": "number"}
-            elif isinstance(value, (list, tuple, np.ndarray)):
-                if len(value) == 0:
-                    schema["properties"][field_name] = {"type": "array", "items": {"type": "null"}}  # или другой тип по умолчанию
-                elif isinstance(value[0], (int, float, np.floating)):
-                    schema["properties"][field_name] = {"type": "array", "items": {"type": "number"}}
-                elif isinstance(value[0], str):
-                    schema["properties"][field_name] = {"type": "array", "items": {"type": "string"}}
-                else:
-                    schema["properties"][field_name] = {"type": "array", "items": self.generate_schema(value[0])}
-            elif hasattr(value, '__slots__'):  
-                schema["properties"][field_name] = self.generate_schema(value)
-            else:
-                schema["properties"][field_name] = {"type": "string"} 
-
-        return schema
-
     async def process_queue(self):
         """Обработка очереди сообщений."""
-        while self.message_queue:
-            type, content = self.message_queue[0]
-            if await self.send_data_with_ack(type, content):
-                self.message_queue.popleft()  # Удаляем сообщение после успешной доставки
-            else:
-                break  # Прерываем цикл при ошибке
+        while True:   
+            try: 
+                if self.message_queue:
+                    type, content = self.message_queue.popleft()
+                    await self.send_data_with_ack(type, content)
+            except Exception as e:
+                self.get_logger().error(f"Error processing data queue: {e}")
+            await asyncio.sleep(0.1)  # Небольшая задержка для снижения нагрузки на процессор
 
-    async def wait_for_ack(self):
-        """Ожидание подтверждения (ACK)."""
-        try:
-            # Ждем ACK в течение 5 секунд
-            ack = await asyncio.wait_for(self.ack_queue.get(), timeout=5)
-            return ack == 'ack'
-        except asyncio.TimeoutError:
-            return False
-
-    async def send_data_with_ack(self, type, content):
+    async def send_data_with_ack(self, type, content, max_retries=3):
         """Отправка данных с подтверждением."""
-        max_retries = 3
-        retry_delay = 2  # Задержка между попытками (в секундах)
-
         for attempt in range(max_retries):
             try:
                 await self.send_data(type, content)
 
-                # Ждем ACK через обработчик сообщений
                 ack_received = await self.wait_for_ack()
                 if ack_received:
-                    self.get_logger().info("Data delivered successfully.")
                     return True
                 else:
                     self.get_logger().warning(f"Attempt {attempt + 1}: No ACK received. Retrying...")
-                    await asyncio.sleep(retry_delay)
             except Exception as e:
                 self.get_logger().error(f"Error sending data: {e}")
-                return False
-
+            await asyncio.sleep(2)  # Задержка между попытками
         self.get_logger().error("Failed to deliver data after multiple attempts.")
         return False
 
-    async def send_data(self, type, content):
-        """Отправка данных"""
-        result_data = {
-            'type': type,
-            'content': content
-        }
-
+    async def wait_for_ack(self):
+        """Ожидание подтверждения (ACK)."""
         try:
-            # Проверка и обновление Access Token
+            ack = await asyncio.wait_for(self.ack_queue.get(), timeout=5)
+            if ack.get('type') == 'ack': 
+                return True
+            return False
+        except asyncio.TimeoutError:
+            return False
+
+    async def send_data(self, type, content):
+        """Отправка данных."""
+        try:
             if not self.access_token:
                 self.get_logger().error("No access token available.")
                 return
-
-            data_json = json.dumps(result_data, separators=(',', ':'))
-            encrypted_data = encrypt_data(data_json)  # Шифруем данные
-
-            # data_base64 = base64.b64encode(data_json.encode()).decode()
-
-            signature = sign_message(encrypted_data)  
+            
+            # Сериализуем данные в JSON
+            data_json = json.dumps({'type': type, 'content': content}, separators=(',', ':'))
+            
+            # Шифруем данные
+            encrypted_data = encrypt_data(data_json)
+            signature = sign_message(encrypted_data)
 
             payload = {
                 'data': encrypted_data,
                 'signature': signature
             }
-            payload_str = json.dumps(payload)
-
-            await self.websocket.send(payload_str)
-
-            self.get_logger().info(f"Schemas sent successfully.")
+            await self.websocket.send(json.dumps(payload))
         except Exception as e:
-            self.get_logger().error(f"Error sending schemas: {e}")
+            self.get_logger().error(f"Error sending data: {e}")
 
     async def handle_websocket(self):
-        """Обработка WebSocket соединения."""
+        """Обработка WebSocket с экспоненциальной задержкой."""
+        retry_delay = 1
         while True:
             try:
-                # Проверяем актуальность токенов перед подключением
                 if not self.ensure_tokens_are_valid():
                     self.get_logger().error("Failed to ensure tokens are valid. Retrying in 5 seconds...")
                     await asyncio.sleep(5)
                     continue
 
-                headers = {
-                    'Authorization': f'Bearer {self.access_token}',
-                }
-
+                headers = {'Authorization': f'Bearer {self.access_token}'}
                 async with websockets.connect(self.websocket_url, additional_headers=headers) as websocket:
                     self.websocket = websocket
                     self.get_logger().info("WebSocket connection established.")
 
+                    # Запуск мониторинга директории в отдельной задаче
+                    monitor_task = asyncio.create_task(self.monitor_and_send())
+
+                    # Запуск обработки очереди сообщений
+                    process_task = asyncio.create_task(self.process_queue())
+
                     async for message in websocket:
                         data = json.loads(message)
                         if data.get('type') == 'ack':
-                            await self.ack_queue.put('ack')  # Сохраняем ACK в очередь
+                            await self.ack_queue.put(data)  # Сохраняем весь объект ack в очередь
                         elif data.get('type') == 'request_schemas':
-                            self.get_logger().info("Received request for schemas")
                             schemas = self.get_all_schemas()
-                            await self.send_data('schemas',schemas)
+                            await self.send_data('schemas', schemas)
                         elif data.get('type') == 'subscribe':
                             topic_name = data.get('topic')
                             self.subscribe(topic_name)
@@ -334,10 +328,20 @@ class PX4WebSocketBridge(Node):
                             self.unsubscribe(topic_name)
                         elif data.get('type') == 'refresh_token':
                             self.refresh_access_token()
-            except Exception as e:
-                self.get_logger().error(f"WebSocket error: {e}. Reconnecting in 5 seconds...")
-                await asyncio.sleep(5)
 
+                    # Остановка задач при разрыве соединения
+                    monitor_task.cancel()
+                    process_task.cancel()
+                    try:
+                        await monitor_task
+                        await process_task
+                    except asyncio.CancelledError:
+                        self.get_logger().info("Tasks cancelled.")
+            except Exception as e:
+                self.get_logger().error(f"WebSocket error: {e}. Reconnecting in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)  # Экспоненциальная задержка, максимум 60 секунд
+                
     def subscribe(self, topic_name):
         """Подписка на топик."""
         if topic_name in [sub.topic_name for sub in self.subscriptions]:
@@ -384,7 +388,7 @@ class PX4WebSocketBridge(Node):
 
     def generic_callback(self, msg, topic_name):
         """Универсальный обработчик для всех топиков."""
-        self.get_logger().info(f"Callback triggered for {topic_name}")
+        # self.get_logger().info(f"Callback triggered for {topic_name}")
         try:
             data = {
                 'name': msg.__class__.__name__,
@@ -392,15 +396,40 @@ class PX4WebSocketBridge(Node):
                 'timestamp': msg.timestamp if hasattr(msg, 'timestamp') else 0,
                 'data': self.extract_data(msg)
             }
-            self.get_logger().info(f"Extracted data: {data}")
-            
+            # self.get_logger().info(f"Extracted data: {data}")
+
             # Добавляем данные в очередь
             self.message_queue.append(('data', data))
-            
-            # Обрабатываем очередь
-            asyncio.create_task(self.process_queue())
+
         except Exception as e:
             self.get_logger().error(f"Error processing {topic_name}: {e}")
+
+    def get_all_schemas(self):
+        """Получение всех схем для топиков."""
+        package = importlib.import_module('px4_msgs.msg')
+
+        message_names = [msg for msg in dir(package) if msg[0].isupper()]  # Фильтр по заглавной букве
+        
+        schemas = []
+        for name in message_names:
+            if name in UNSUPPORTED_MSG_TYPES:
+                continue
+     
+            topic_name = self.get_topic_name(name)
+            
+            if not self.is_topic_active(topic_name):
+                continue
+
+            msg = getattr(package, name)
+
+            schema = self.generate_schema(msg)
+            schemas.append({
+                'topic': name,
+                'encoding': "json",
+                'schemaName': topic_name,   
+                'schema': schema
+            })
+        return schemas
 
     def get_topic_name(self, name):
         """
@@ -431,15 +460,52 @@ class PX4WebSocketBridge(Node):
             return False
         except Exception as e:
             return False
-
+        
     def extract_data(self, msg):
-        """Универсальный метод для извлечения данных из сообщения PX4."""
-        data = {}
+            """Универсальный метод для извлечения данных из сообщения PX4."""
+            data = {}
+            if not hasattr(msg, '__slots__'):
+                return data
+            
+            internal_fields = {'_header', '_stamp'}  # Добавьте сюда другие служебные поля, если необходимо
+
+            for field in msg.__slots__:
+                if field in internal_fields:
+                    continue
+
+                field_name = ''.join(word.capitalize() for word in field.lstrip('_').split('_'))
+                value = getattr(msg, field)
+
+                if isinstance(value, (int, float, np.floating)):
+                    if math.isnan(value):
+                        data[field_name] = 'Nan'
+                    elif math.isinf(value):
+                        data[field_name] = "Infinity" if value > 0 else "-Infinity"
+                    else:
+                        data[field_name] = value
+                elif isinstance(value, (list, tuple, np.ndarray)):
+                    if len(value) == 0:
+                        data[field_name] = 'None'
+                    elif isinstance(value[0], (int, float, np.floating)):
+                        data[field_name] = [float(v) for v in value]
+                    elif isinstance(value[0], str):
+                        data[field_name] = list(value)
+                    else:
+                        data[field_name] = [self.extract_data(v) for v in value] 
+                elif hasattr(value, '__slots__'):  
+                    data[field_name] = self.extract_data(value)       
+                else:
+                    data[field_name] = str(value)
+            return data    
+
+    def generate_schema(self, msg):
+        """Генерация схемы для типа сообщения."""
+        schema = {"type": "object", "properties": {}}
 
         if not hasattr(msg, '__slots__'):
-            return data
+            return schema
         
-        internal_fields = {'_header', '_stamp'}  # Добавьте сюда другие служебные поля, если необходимо
+        internal_fields = {'_header', '_stamp'}
 
         for field in msg.__slots__:
             if field in internal_fields:
@@ -449,27 +515,25 @@ class PX4WebSocketBridge(Node):
             value = getattr(msg, field)
 
             if isinstance(value, (int, float, np.floating)):
-                if math.isnan(value):
-                    data[field_name] = 'Nan'
-                elif math.isinf(value):
-                    data[field_name] = "Infinity" if value > 0 else "-Infinity"
+                if math.isnan(value) or math.isinf(value):
+                    schema["properties"][field_name] = {"type": "string"}
                 else:
-                    data[field_name] = value
+                    schema["properties"][field_name] = {"type": "number"}
             elif isinstance(value, (list, tuple, np.ndarray)):
                 if len(value) == 0:
-                    data[field_name] = 'None'
+                    schema["properties"][field_name] = {"type": "array", "items": {"type": "null"}}  # или другой тип по умолчанию
                 elif isinstance(value[0], (int, float, np.floating)):
-                    data[field_name] = [float(v) for v in value]
+                    schema["properties"][field_name] = {"type": "array", "items": {"type": "number"}}
                 elif isinstance(value[0], str):
-                    data[field_name] = list(value)
+                    schema["properties"][field_name] = {"type": "array", "items": {"type": "string"}}
                 else:
-                    data[field_name] = [self.extract_data(v) for v in value] 
+                    schema["properties"][field_name] = {"type": "array", "items": self.generate_schema(value[0])}
             elif hasattr(value, '__slots__'):  
-                data[field_name] = self.extract_data(value)       
+                schema["properties"][field_name] = self.generate_schema(value)
             else:
-                data[field_name] = str(value)
+                schema["properties"][field_name] = {"type": "string"} 
 
-        return data        
+        return schema
 
 async def spin_node(node):
     """Асинхронный spin для ROS 2 узла."""
@@ -481,9 +545,10 @@ def main(args=None):
     rclpy.init(args=args)
     px4_websocket_bridge = PX4WebSocketBridge()
 
-    # Запуск асинхронного цикла событий
     loop = asyncio.get_event_loop()
+
     loop.create_task(spin_node(px4_websocket_bridge))
+
     loop.run_until_complete(px4_websocket_bridge.handle_websocket())
 
     # Остановка цикла событий
@@ -493,4 +558,5 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
 
