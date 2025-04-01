@@ -20,8 +20,6 @@ setup(
     entry_points={
         'console_scripts': [
             'px4_websocket_node = src.px4_websocket_node:main',
-            'log_sender_node = src.log_sender_node:main',  
-            'keyboard_node = src.keyboard_node:main',
         ],
     },
 )

@@ -6,9 +6,21 @@
   <description>This package helps to subscribe to px4 topics and communicate with custom server</description>
   <maintainer email="johndoe@example.com">alexei</maintainer>
   <license>TODO: License declaration</license>
+
+  <!-- Основные зависимости -->
   <depend>px4_msgs</depend>
-  <depend>Crypto.Cipher</depend>
-  <depend>Crypto.Util.Padding</depend>
+  <depend>rclpy</depend>
+  <depend>python3-numpy</depend>
+  
+  <!-- Зависимости для работы с WebSockets -->
+  <depend>python3-websockets</depend>
+  
+  <!-- Зависимости для шифрования -->
+  <exec_depend>python3-pycryptodome</exec_depend>
+  <exec_depend>python3-keyring</exec_depend>
+  <exec_depend>python3-jwt</exec_depend>
+
+  <!-- Тестовые зависимости -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
